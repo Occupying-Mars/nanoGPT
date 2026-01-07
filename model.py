@@ -41,6 +41,8 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
+        self.head_dim = config.n_embd // config.n_head
+        self.rope_theta = config.rope_theta
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         if not self.flash:
@@ -48,8 +50,39 @@ class CausalSelfAttention(nn.Module):
             # causal mask to ensure that attention is only applied to the left in the input sequence
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
+        
+        # precompute frequencies for RoPE
+        freqs = 1.0 / (self.rope_theta ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim))
+        self.register_buffer("freqs", freqs, persistent=False)
 
-    def forward(self, x):
+    def apply_rope(self, x, positions):
+        # x: (B, nh, T, hs)
+        # positions: (T,)
+        B, nh, T, hs = x.shape
+        
+        # compute angles: (T, hs/2)
+        angles = positions.unsqueeze(1) * self.freqs.unsqueeze(0)
+        
+        # compute cos and sin: (T, hs/2)
+        cos = torch.cos(angles)
+        sin = torch.sin(angles)
+        
+        # reshape x into pairs: (B, nh, T, hs/2, 2)
+        x_reshaped = x.reshape(B, nh, T, hs // 2, 2)
+        
+        # apply rotation
+        x1 = x_reshaped[..., 0]  # (B, nh, T, hs/2)
+        x2 = x_reshaped[..., 1]  # (B, nh, T, hs/2)
+        
+        # rotate: [cos * x1 - sin * x2, sin * x1 + cos * x2]
+        rotated_x1 = x1 * cos - x2 * sin
+        rotated_x2 = x1 * sin + x2 * cos
+        
+        # stack back and reshape
+        rotated = torch.stack([rotated_x1, rotated_x2], dim=-1)
+        return rotated.reshape(B, nh, T, hs)
+
+    def forward(self, x, positions):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
@@ -57,6 +90,10 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+
+        # apply RoPE to queries and keys
+        q = self.apply_rope(q, positions)
+        k = self.apply_rope(k, positions)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
@@ -100,8 +137,8 @@ class Block(nn.Module):
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
+    def forward(self, x, positions):
+        x = x + self.attn(self.ln_1(x), positions)
         x = x + self.mlp(self.ln_2(x))
         return x
 
@@ -114,6 +151,7 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    rope_theta: float = 10000.0 # base frequency for RoPE
 
 class GPT(nn.Module):
 
@@ -125,7 +163,6 @@ class GPT(nn.Module):
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
-            wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
@@ -150,13 +187,11 @@ class GPT(nn.Module):
     def get_num_params(self, non_embedding=True):
         """
         Return the number of parameters in the model.
-        For non-embedding count (default), the position embeddings get subtracted.
-        The token embeddings would too, except due to the parameter sharing these
-        params are actually used as weights in the final layer, so we include them.
+        For non-embedding count (default), the token embeddings would be subtracted,
+        but due to the parameter sharing these params are actually used as weights 
+        in the final layer, so we include them.
         """
         n_params = sum(p.numel() for p in self.parameters())
-        if non_embedding:
-            n_params -= self.transformer.wpe.weight.numel()
         return n_params
 
     def _init_weights(self, module):
@@ -175,10 +210,9 @@ class GPT(nn.Module):
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
+        x = self.transformer.drop(tok_emb)
         for block in self.transformer.h:
-            x = block(x)
+            x = block(x, pos)
         x = self.transformer.ln_f(x)
 
         if targets is not None:
@@ -198,7 +232,6 @@ class GPT(nn.Module):
         # but want to use a smaller block size for some smaller, simpler model
         assert block_size <= self.config.block_size
         self.config.block_size = block_size
-        self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
         for block in self.transformer.h:
             if hasattr(block.attn, 'bias'):
                 block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
